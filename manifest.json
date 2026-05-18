@@ -1,0 +1,404 @@
+/**
+ * Satellite Proximity Tracker - Main Application
+ * Orchestrates all modules and manages the application lifecycle
+ */
+class SatelliteTrackerApp {
+    constructor() {
+        this.satEngine = new SatelliteEngine();
+        this.locService = new LocationService();
+        this.passPredictor = null;
+        this.notificationService = new NotificationService();
+        this.audioEngine = new AudioEngine();
+        this.uiController = new UIController();
+        this.arEngine = null;
+        this.cesiumView = null;
+        this.issTracker = null;
+
+        this.observer = null;
+        this.satellites = [];
+        this.visibleSatellites = [];
+        this.passes = [];
+
+        this.currentMode = '2d';
+        this.updateInterval = null;
+        this.passUpdateInterval = null;
+
+        this.map = null;
+        this.mapMarkers = new Map();
+    }
+
+    async init() {
+        // Setup event listeners
+        this.setupEventListeners();
+
+        // Initialize audio
+        this.audioEngine.startAmbientDrone();
+
+        // Request location
+        document.getElementById('grant-loc').addEventListener('click', () => {
+            this.audioEngine.playClick();
+            this.initializeLocation();
+        });
+    }
+
+    async initializeLocation() {
+        try {
+            this.uiController.updateLocationStatus('ACQUIRING...');
+            this.observer = await this.locService.requestLocation();
+            this.uiController.updateLocationStatus(
+                `${this.observer.lat.toFixed(4)}, ${this.observer.lon.toFixed(4)}`
+            );
+
+            // Hide location request overlay
+            document.getElementById('loc-request').classList.add('hidden');
+
+            // Start location watching
+            this.locService.startWatching((pos) => {
+                this.observer = pos;
+            });
+
+            // Initialize modules
+            await this.initializeModules();
+
+        } catch (error) {
+            console.error('Location error:', error);
+            this.uiController.updateLocationStatus('FALLBACK MODE', true);
+            this.audioEngine.playError();
+
+            // Try approximate location
+            this.observer = await this.locService.getApproximateLocation();
+            document.getElementById('loc-request').classList.add('hidden');
+            await this.initializeModules();
+        }
+    }
+
+    async initializeModules() {
+        // Initialize pass predictor
+        this.passPredictor = new PassPredictor(this.satEngine);
+
+        // Initialize notifications
+        await this.notificationService.init();
+
+        // Fetch satellite data
+        this.uiController.showToast('SYSTEM', 'Downloading orbital data...');
+        this.satellites = await this.satEngine.fetchTLEData();
+        this.uiController.updateSatCount(this.satellites.length, 0);
+
+        // Initialize 2D Map
+        this.initMap();
+
+        // Initialize 3D Cesium view
+        this.cesiumView = new CesiumView('cesiumContainer');
+        await this.cesiumView.init();
+        this.cesiumView.addObserver(this.observer.lat, this.observer.lon);
+
+        // Initialize ISS tracker
+        this.issTracker = new ISSTracker();
+        await this.issTracker.init('iss-cesiumContainer');
+
+        // Start update loops
+        this.startUpdateLoops();
+
+        // Play initialization sound
+        this.audioEngine.playPassAlert();
+        this.uiController.showToast('SYSTEM ONLINE', `Tracking ${this.satellites.length} satellites`);
+    }
+
+    initMap() {
+        this.map = L.map('map', {
+            center: [this.observer.lat, this.observer.lon],
+            zoom: 4,
+            zoomControl: false,
+            attributionControl: false
+        });
+
+        // Dark matter tiles
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            maxZoom: 19,
+            subdomains: 'abcd'
+        }).addTo(this.map);
+
+        // Add observer marker
+        const observerIcon = L.divIcon({
+            className: 'observer-marker',
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
+        });
+
+        L.marker([this.observer.lat, this.observer.lon], { icon: observerIcon })
+            .addTo(this.map)
+            .bindPopup('<div class="sat-popup"><h3>YOUR LOCATION</h3></div>');
+
+        // Add visibility circle (approximate horizon)
+        L.circle([this.observer.lat, this.observer.lon], {
+            radius: 2000000, // ~2000km visibility radius for LEO
+            color: '#00f0ff',
+            weight: 1,
+            fillColor: '#00f0ff',
+            fillOpacity: 0.03,
+            dashArray: '10, 10'
+        }).addTo(this.map);
+    }
+
+    startUpdateLoops() {
+        // Update satellite positions every 5 seconds
+        this.updateInterval = setInterval(() => {
+            this.updateSatellitePositions();
+        }, 5000);
+
+        // Initial update
+        this.updateSatellitePositions();
+
+        // Update passes every 5 minutes
+        this.updatePasses();
+        this.passUpdateInterval = setInterval(() => {
+            this.updatePasses();
+        }, 300000);
+    }
+
+    updateSatellitePositions() {
+        if (!this.observer) return;
+
+        // Calculate all visible satellites
+        this.visibleSatellites = this.satEngine.getVisibleSatellites(
+            this.observer.lat, 
+            this.observer.lon, 
+            this.satellites
+        );
+
+        // Update UI
+        this.uiController.updateSatCount(this.satellites.length, this.visibleSatellites.length);
+        this.uiController.updateClosestSatellite(this.visibleSatellites[0] || null);
+        this.uiController.updateTrackedSatellites(this.visibleSatellites);
+
+        // Update 2D map
+        this.updateMapMarkers();
+
+        // Update 3D view
+        this.updateCesiumView();
+
+        // Update ISS tracker
+        if (this.issTracker) {
+            this.issTracker.updateTelemetry(this.satEngine, this.observer);
+        }
+
+        // Update AR if active
+        if (this.currentMode === 'ar' && this.arEngine) {
+            this.arEngine.setSatellites(this.visibleSatellites);
+        }
+
+        // Sound alerts
+        if (this.visibleSatellites.length > 0) {
+            const closest = this.visibleSatellites[0];
+            if (closest.range < 500 && !this.lastClosestRange || closest.range < this.lastClosestRange) {
+                this.audioEngine.playProximityWarning();
+            }
+            this.lastClosestRange = closest.range;
+        }
+    }
+
+    updateMapMarkers() {
+        if (!this.map) return;
+
+        // Remove old markers for satellites no longer visible
+        for (const [name, marker] of this.mapMarkers) {
+            const stillVisible = this.visibleSatellites.find(s => s.name === name);
+            if (!stillVisible) {
+                this.map.removeLayer(marker);
+                this.mapMarkers.delete(name);
+            }
+        }
+
+        // Add/update markers for visible satellites
+        this.visibleSatellites.forEach((sat, index) => {
+            const isClosest = index === 0;
+
+            if (this.mapMarkers.has(sat.name)) {
+                // Update position
+                const marker = this.mapMarkers.get(sat.name);
+                marker.setLatLng([sat.lat, sat.lon]);
+
+                // Update popup
+                marker.setPopupContent(this.createPopupContent(sat));
+            } else {
+                // Create new marker
+                const marker = L.circleMarker([sat.lat, sat.lon], {
+                    radius: isClosest ? 10 : 6,
+                    fillColor: isClosest ? '#ff00ff' : '#00f0ff',
+                    color: isClosest ? '#ff00ff' : '#00f0ff',
+                    weight: isClosest ? 3 : 2,
+                    opacity: 0.9,
+                    fillOpacity: 0.6
+                }).addTo(this.map);
+
+                marker.bindPopup(this.createPopupContent(sat));
+                this.mapMarkers.set(sat.name, marker);
+
+                // Play detection sound
+                this.audioEngine.playDetection();
+            }
+        });
+    }
+
+    createPopupContent(sat) {
+        return `
+            <div class="sat-popup">
+                <h3>${sat.name}</h3>
+                <div class="popup-data">
+                    <span class="label">ELEVATION</span><span class="value">${sat.elevation.toFixed(1)}°</span>
+                    <span class="label">AZIMUTH</span><span class="value">${sat.azimuth.toFixed(1)}°</span>
+                    <span class="label">RANGE</span><span class="value">${sat.range.toFixed(0)} km</span>
+                    <span class="label">ALTITUDE</span><span class="value">${sat.alt.toFixed(0)} km</span>
+                    <span class="label">VELOCITY</span><span class="value">${(sat.velocity * 3.6).toFixed(0)} km/h</span>
+                </div>
+            </div>
+        `;
+    }
+
+    updateCesiumView() {
+        if (!this.cesiumView) return;
+
+        this.visibleSatellites.forEach(sat => {
+            const satData = this.satellites.find(s => s.name === sat.name);
+            if (satData) {
+                this.cesiumView.updateSatellite(satData, sat);
+            }
+        });
+    }
+
+    async updatePasses() {
+        if (!this.observer || !this.passPredictor) return;
+
+        this.passes = await this.passPredictor.getNextPasses(
+            this.observer.lat,
+            this.observer.lon,
+            this.satellites,
+            10
+        );
+
+        this.uiController.updatePassPredictions(this.passes);
+
+        // Check notifications
+        this.notificationService.checkAndNotify(this.passes);
+    }
+
+    setupEventListeners() {
+        // Mode switcher
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const mode = e.target.dataset.mode;
+                this.switchMode(mode);
+            });
+        });
+
+        // Notification toggle
+        document.getElementById('notify-toggle')?.addEventListener('change', async (e) => {
+            if (e.target.checked) {
+                await this.notificationService.toggle();
+                this.audioEngine.playClick();
+            } else {
+                this.notificationService.enabled = false;
+            }
+        });
+
+        // Audio toggle
+        document.getElementById('audio-toggle')?.addEventListener('click', () => {
+            const enabled = this.audioEngine.toggle();
+            document.getElementById('audio-toggle').textContent = enabled ? '🔊' : '🔇';
+        });
+
+        // Volume slider
+        document.getElementById('volume-slider')?.addEventListener('input', (e) => {
+            this.audioEngine.setVolume(e.target.value);
+        });
+
+        // AR permission
+        document.getElementById('grant-ar')?.addEventListener('click', () => {
+            this.initializeAR();
+        });
+
+        // Window resize
+        window.addEventListener('resize', () => {
+            if (this.map) this.map.invalidateSize();
+        });
+    }
+
+    async switchMode(mode) {
+        this.audioEngine.playModeSwitch();
+        this.currentMode = mode;
+
+        // Update buttons
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.mode === mode);
+        });
+
+        // Update containers
+        document.querySelectorAll('.view-container').forEach(container => {
+            container.classList.remove('active');
+        });
+
+        switch (mode) {
+            case '2d':
+                document.getElementById('map-container').classList.add('active');
+                if (this.map) this.map.invalidateSize();
+                break;
+            case '3d':
+                document.getElementById('cesium-container').classList.add('active');
+                break;
+            case 'ar':
+                document.getElementById('ar-container').classList.add('active');
+                this.initializeAR();
+                break;
+            case 'iss':
+                document.getElementById('iss-container').classList.add('active');
+                break;
+        }
+    }
+
+    async initializeAR() {
+        if (this.arEngine) return;
+
+        const arPermission = document.getElementById('ar-permission');
+
+        try {
+            this.arEngine = new AREngine();
+            await this.arEngine.init(
+                document.getElementById('ar-video'),
+                document.getElementById('ar-canvas'),
+                document.getElementById('ar-overlay')
+            );
+            this.arEngine.setObserver(this.observer);
+            this.arEngine.setSatellites(this.visibleSatellites);
+
+            if (arPermission) arPermission.classList.add('hidden');
+            this.uiController.showToast('AR MODE', 'Point camera at the sky');
+            this.audioEngine.playPassAlert();
+        } catch (error) {
+            console.error('AR initialization failed:', error);
+            if (arPermission) arPermission.classList.remove('hidden');
+            this.uiController.showToast('AR ERROR', 'Camera access required');
+            this.audioEngine.playError();
+        }
+    }
+
+    destroy() {
+        if (this.updateInterval) clearInterval(this.updateInterval);
+        if (this.passUpdateInterval) clearInterval(this.passUpdateInterval);
+        if (this.arEngine) this.arEngine.stop();
+        if (this.cesiumView) this.cesiumView.destroy();
+        if (this.issTracker) this.issTracker.destroy();
+        this.locService.stopWatching();
+        this.audioEngine.stopAmbientDrone();
+    }
+}
+
+// Initialize app when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    const app = new SatelliteTrackerApp();
+    app.init();
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+        app.destroy();
+    });
+});
